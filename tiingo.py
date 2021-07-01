@@ -88,9 +88,11 @@ class TiingoDownloader(BaseClass):
         file information and returns it for all available files. Saves results to
         'self.path/Temp/'.
 
-        Args:
+        Parameters
+        ----------
         
-        Returns:
+        Returns
+        -------
             Pandas DataFrame: Table containing (ticker, symbol, timeframe, path) infos
         """
 
@@ -122,7 +124,7 @@ class TiingoDownloader(BaseClass):
         
         return hits
   
-    def download_ticker(self, ticker: str, timeframe: int, startdate: str, enddate: str): 
+    def download_ticker(self, ticker: str, timeframe: int, start: str, end: str): 
         """ This function downloads a ticker for a given period and sampling frequency.
 
         Parameters
@@ -131,9 +133,9 @@ class TiingoDownloader(BaseClass):
                 Specifies the symbol to download
             timeframe : str
                 Specifies the bar frequency. In minutes
-            startdate :str
+            start :str
                 Date that specifies the first date of interest, fmt: 'YYYY-mm-dd HH:MM:ss'
-            enddate : str
+            end : str
                 Date that specifies the last date of interest, fmt: 'YYYY-mm-dd HH:MM:ss'
         
         Returns
@@ -143,10 +145,10 @@ class TiingoDownloader(BaseClass):
         """
         # Switching between API endpoints
         if timeframe == 1440:
-            df = self._get_eod(ticker=ticker, startdate=startdate)
+            df = self._get_eod(ticker=ticker, startdate=start, enddate=end)
         else:
             # Defining start and end of period of interest
-            startdate, enddate = pd.to_datetime(startdate), pd.to_datetime(enddate)
+            startdate, enddate = pd.to_datetime(start), pd.to_datetime(end)
             span = (pd.to_datetime("2017-01-01 00:00:00"), enddate)
     
             if startdate > span[0]:
@@ -243,19 +245,14 @@ class TiingoDownloader(BaseClass):
         
         return None
 
-    def _populate_ticker(self,
-                         ticker: str,
-                         asset_type: str,
-                         timeframe: str, 
-                         startdate: str, 
-                         enddate: str):
+    def _populate_ticker(self, ticker: str, asset_type: str, timeframe: str, start: str, end: str):
         """ Helper function that downloads a single ticker"""
 
         try:
             if not os.path.isfile(f"{self.path}/Data/{asset_type}/{timeframe}/{ticker}_{timeframe}.csv"):
                 df = self.download_ticker(ticker=ticker, 
-                                          startdate=startdate, 
-                                          enddate=enddate, 
+                                          startdate=start, 
+                                          enddate=end, 
                                           timeframe=timeframe)
                 if type(df) == type(None):
                     self._print(msg=f"{asset_type}: {ticker}_{timeframe} not downloaded!") 
@@ -273,16 +270,16 @@ class TiingoDownloader(BaseClass):
         
         return None
 
-    def download_crypto(self, ticker: str, startdate: str, enddate: str, timeframe: int):
+    def download_crypto(self, ticker: str, start: str, end: str, timeframe: int):
         """ This function downloads a crypto pair for a given period and sampling frequency.
 
         Parameters
         ----------
             ticker : str
                 Specifies the symbol to download
-            startdate :str
+            start :str
                 Date that specifies the first date of interest, fmt: 'YYYY-mm-dd HH:MM:ss'
-            enddate : str
+            end : str
                 Date that specifies the last date of interest, fmt: 'YYYY-mm-dd HH:MM:ss'
             timeframe : str
                 Specifies the bar frequency. In minutes
@@ -292,8 +289,8 @@ class TiingoDownloader(BaseClass):
         df : pandas.DataFrame
                 Table containing dates and price data (ohlcv+)
         """
-        startdate = pd.to_datetime(startdate)
-        enddate = pd.to_datetime(enddate)
+        startdate = pd.to_datetime(start)
+        enddate = pd.to_datetime(end)
         span = (startdate, enddate)
         intervals = pd.date_range(start=span[0], end=span[-1], freq=f"{timeframe}min")
 
@@ -371,11 +368,7 @@ class TiingoDownloader(BaseClass):
         
         return None
 
-    def _populate_one_crypto(self, 
-                             ticker: str, 
-                             timeframes: list, 
-                             baseCurrency: str, 
-                             quoteCurrency: str):
+    def _populate_one_crypto(self, ticker: str, timeframes: list, baseCurrency: str, quoteCurrency: str):
         """ Helper function that downloads a single crypto pair"""
 
         try:
