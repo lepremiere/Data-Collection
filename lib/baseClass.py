@@ -1,4 +1,5 @@
 import os
+from pandas import to_datetime
 from datetime import datetime
 
 class BaseClass:
@@ -15,11 +16,21 @@ class BaseClass:
                 print(f"{datetime.now().time().strftime('%H:%M:%S')}:\t{msg}")
 
     def _create_folder(self, folder):
-        """ Check if folder exists, otherwise creating it """
-
         if not os.path.exists(self.path + f"/{folder}/"):
-            self.print(msg=f"Creating new folder {folder}...")
+            self._print(msg=f"Creating new folder {folder}...")
             os.makedirs(self.path + f"/{folder}/")
+    
+    def _to_dt_idx(self, df):
+        df = df.set_index("date")
+        df.index = to_datetime(df.index)
+        
+        return df
+
+    def _reset_idx(self, df):
+        df = df.reset_index()
+        df = df.drop(columns="index")
+
+        return df
 
 if __name__ == "__main__":
     pass
