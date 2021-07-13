@@ -1,141 +1,280 @@
 import os 
-import datetime
-import requests as r
+import json
+import requests 
 import pandas as pd
 import polars as pl
 import numpy as np
-from tqdm import tqdm
-from multiprocessing import Pool
-from pandas.tseries.offsets import BDay
+from datetime import datetime
+from multiprocessing import Pool, cpu_count
 from lib.baseClass import BaseClass
 
 class EODDownloader(BaseClass):
 
     def __init__(self, api_key, exchanges, folder=None, verbose=True):
+        """ This class provides a solution to automatically 
+        downloading data from Tiingos RESTful API. """
+
         super().__init__(folder=folder, verbose=verbose)
         self.host = "https://eodhistoricaldata.com/api/"
         self.api_key = api_key
         self.exchanges = exchanges
+        self.cores = cpu_count() 
         self.check_ticker()
+    
+    def _get_response(self, url):
+        """ Access point of the EOD-API.
 
-    def check_ticker(self):
-        self.print(msg=f"Checking Ticker Lists...")
-        folders = ["Temp", "TickerInfo", "TickerInfo/TickerLists", "Data"]
-        for folder in folders:
-            self.create_folder(folder)
+        Parameters
+        ----------
+        url: string
+            Specifies the endpoint to access.
 
-        if not os.path.isfile(f"{self.path}/TickerInfo/exchangesList.csv"):
-            self.print(msg=f"Getting available exchanges...")
-            url = "exchanges-list/?"
-            exchanges_list = pd.DataFrame.from_dict(self.get_response(url=url))
-            exchanges_list.to_csv(f"{self.path}/TickerInfo/exchangesList.csv")
+        Returns
+        -------
+        requestResponse: json
+            API response in json format.
+        """
+        request = f"{self.host}{url}api_token={self.api_key}&fmt=json"
+        requestResponse = requests.get(request)
+
+        return requestResponse.json()   
+
+    def check_ticker(self, force_update=False):
+        """ Checks/updates available exchanges and its tickers.
+
+        Checks the last update of exchanges and ticker lists and
+        updates them if older than the current day. Results will 
+        be stored in folder ".../TickerInfo/". Uses parallelization.
+
+        Parameters
+        ----------
+        force_update : boolean
+            If True, exchanges and ticker lists will be updated
+            regardless of the last update.
         
-        exchanges_list = pd.read_csv(f"{self.path}/TickerInfo/exchangesList.csv")
+        Returns
+        -------
+        None
+        """
+        # Check last update to reduce API data load
+        last_update = self._last_update(force_update=force_update)
+        if last_update and last_update == pd.to_datetime(datetime.now().date()):
+            self._print(msg=f"Ticker info up to date with last update: {last_update.date()}")
+            return None
+
+        self._print(msg=f"Checking Ticker Lists!")
+        folders = ["Temp", "TickerInfo", "TickerInfo/TickerLists"]
+        for folder in folders:
+            self._create_folder(folder)
+
+        self._print(msg=f"Getting available exchanges!")
+        url = "exchanges-list/?"
+        exchanges_list = pd.DataFrame.from_dict(self.get_response(url=url))
+        pl.from_pandas(exchanges_list).to_csv(f"{self.path}/TickerInfo/exchangesList.csv")
+        
+        l = []
+        exchanges_list = pl.read_csv(f"{self.path}/TickerInfo/exchangesList.csv").to_pandas()
         for name, exchange in exchanges_list.loc[:, ["Name", "Code"]].to_numpy():
-            if not os.path.isfile(f"{self.path}/TickerInfo/TickerLists/{exchange}.csv"):
-                try:
-                    if exchange == "MONEY" or exchange == "BOND":
-                        break
-                    self.print(msg=f"Getting available ticker for {name} - {exchange}...")
-                    url = f"exchange-symbol-list/{exchange}?"
-                    ticker_lsit = pd.DataFrame.from_dict(self.get_response(url=url))
-                    ticker_lsit.to_csv(f"{self.path}/TickerInfo/TickerLists/{exchange}.csv")
-                except Exception as e:
-                    self.print(msg=f"Exchange: {name} - {exchange} failed due to: {e}")
+            if exchange == "MONEY" or exchange == "BOND":
+                continue
+            l.append((name, exchange, url))
+        
+        with Pool(self.cores) as p:
+            p.starmap(self._get_ticker_list, l)
+
+        with open(f"{self.path}/Temp/last_update.txt", "w") as f:
+            f.write(str(datetime.now().date()))
+            f.close()
+
+        return None
+
+    def _get_ticker_list(self, name, exchange, url):
+        """ Helper function to access a single exchange 
+            and its ticker list."""
+
+        self._print(msg=f"Getting available ticker for {name} - {exchange}...")
+        url = f"exchange-symbol-list/{exchange}?"
+        ticker_list = pd.DataFrame.from_dict(self._get_response(url=url))
+        pl.from_pandas(ticker_list).to_csv(f"{self.path}/TickerInfo/TickerLists/{exchange}.csv")
+
+        return None
+
+    def _last_update(self, force_update):
+        """ Helper function that returns the last ticker list update."""
+
+        if not force_update:
+            if os.path.isfile(f"{self.path}/Temp/last_update.txt"):
+                
+                with open(f"{self.path}/Temp/last_update.txt", "r") as f:
+                    last_update = pd.to_datetime(f.read())
+                    f.close()
+
+                return last_update
+
+        return None
 
     def get_available_files(self):
+        """ Check for available files in the data base.
 
-        self.print(msg=f"Getting available files!")
-        folder = f"{self.path}/Data/"
+        This method walks through all price data files,
+        gets infos for each symbol and checks if fundamental
+        data is available. Results are stored in 
+        ".../Temp/available_files.csv". Uses parallelization.
+
+        Parameters
+        ----------
+        
+        Returns
+        -------
+        None
+        """
+
+        self._print(msg=f"Getting available files!")
+        folder = f"{self.path}/PriceData/"
         d = {}
-        for root, dirs, files in os.walk(folder):
+
+        for root, _, files in os.walk(folder):
             d[root] = files
 
-        hits = []
+        l = []
         for key, files in d.items():
             if len(files) > 0 and files:
-                for file in tqdm(files):
-                    symbol = str(file.split("_")[0])
-                    typ, t = key.split("/")[-1].split("\\")
-                    path = f"{key}/{file}"
-                    df = pl.read_csv(path).to_pandas()
-                    start, end = df.date.iloc[[0, -1]]
-                    start = start.strftime("%Y-%m-%d")
-                    end = end.strftime("%Y-%m-%d")
-                    hits.append([symbol, typ, t, start, end, path])
-        if len(hits) > 0:
-            hits = pd.DataFrame(hits, columns=["symbol", "type", "timeframe", "start", "end", "path"], index=None)
-            hits.reset_index(inplace=True)
-            hits.drop(columns="index", inplace=True)
-            pl.from_pandas(hits).to_csv(f"{self.path}/Temp/available_files.csv")
-            self.get_infos()
-            self.print(msg=f"{len(hits)} files found!")
-        else:
-            self.print(msg=f"No available files found!")
-    
-    def get_infos(self):
+                for file in files:
+                    l.append((key, file))
+        
+        with Pool(self.cores) as p:
+            hits = p.starmap(self._get_one_price_data, l)
 
-        self.print(msg=f"Getting according infos!")
+        if len(hits) > 0:
+            cols = ["symbol", "type", "timeframe", "start", "end", "path", "fundamentals_path"]
+            hits = pd.DataFrame(hits, columns=cols, index=None)
+            hits = hits.reset_index().drop(columns="index")
+            pl.from_pandas(hits).to_csv(f"{self.path}/Temp/available_files.csv")
+            self._get_infos()
+            self._print(msg=f"{len(hits)} files found!")
+        else:
+            self._print(msg=f"No available files found!")
+        
+        return None
+    
+    def _get_one_price_data(self, key, file):
+        """ Helper function to access one price data file."""
+
+        path = f"{key}/{file}"
+        df = pl.read_csv(path).to_pandas()
+        symbol = str(file.split("_")[0])
+        typ, t = key.split("/")[-1].split("\\")
+        start, end = df.date.iloc[[0, -1]]
+        start = start.strftime("%Y-%m-%d")
+        end = end.strftime("%Y-%m-%d")
+
+        fundamentals_path = None
+        if os.path.isfile(f"{self.path}/Fundamentals/{typ}/{symbol}.txt"):
+            fundamentals_path = f"{self.path}/Fundamentals/{typ}/{symbol}.txt"
+
+        return [symbol, typ, t, start, end, path, fundamentals_path]
+
+    def _get_infos(self):
+        """ Get additional information for each symbol.
+
+        This method gets "name", "isin", "exchange", "path" and
+        "fundamental_path" for every available symbol. Uses parallelization.
+
+        Parameters
+        ----------
+        
+        Returns
+        -------
+        None
+        """
+        self._print(msg=f"Getting according infos!")
         if not os.path.isfile(f"{self.path}/Temp/available_files.csv"):
             self.get_available_files()
         df = pl.read_csv(f"{self.path}/Temp/available_files.csv").to_pandas()
         df.set_index("symbol", inplace=True)
-        df["name"] = np.nan
-        df["isin"] = np.nan
 
-        infos = pd.concat([pl.read_csv(f"{self.path}/TickerInfo/TickerLists/{exchange}.csv").to_pandas()\
-                                             for exchange in self.exchanges])                
+        infos = pd.concat([pl.read_csv(f"{self.path}/TickerInfo/TickerLists/{exchange}.csv")\
+                            .to_pandas() for exchange in self.exchanges])                
         infos.set_index('Code', inplace=True)
-        duplicates = pd.read_csv(f"{self.path}/duplicates.csv")
+        duplicates = pl.read_csv(f"{self.path}/duplicates.csv").to_pandas()
 
-        for i in tqdm(range(len(df))):    
+        l = []
+        for i in range(len(df)):    
             symbol = df.index[i]
-            type = df.type[i]
+            typ = df.type[i]
+            l.append((symbol, typ, duplicates, infos))
 
-            if symbol in duplicates.Code.values:
-                ind = np.logical_and(duplicates.Code == symbol, duplicates.Type == type)
-                print(duplicates.Name.loc[ind], symbol)
-                name = duplicates.Name.loc[ind].values[0]
-                isin = duplicates.Isin.loc[ind].values[0]
-                exchange = duplicates.Exchange.loc[ind].values[0]
-            else:
-                ind = np.logical_and(infos.index == symbol, infos.Type == type)
-                temp_df = infos.loc[ind,:]
+        with Pool(self.cores) as p:
+            res = p.starmap(self._get_info, l)
+        
+        res = pd.DataFrame(res, columns=["symbol", "name", "isin", "exchange"])
+        res.set_index("symbol", inplace=True)
 
-                if len(np.shape(temp_df)) == 2:
-                    name = temp_df.Name[np.argmax([len(s) for s in temp_df.Name])]
-                    isin = temp_df.Isin[np.argmax([len(s) for s in temp_df.Isin])]
-                    exchange = temp_df.Exchange[0]
-                else:
-                    name = temp_df.Name
-                    isin = temp_df.Isin
-                    exchange = temp_df.Exchange
-
-            loc = np.logical_and(df.index == symbol, df.type == type)
-            df.loc[loc, "isin"] = isin
-            df.loc[loc, "name"] = name
-            df.loc[loc, "exchange"] = exchange
-
-        df.reset_index(inplace=True)
-        df = df.loc[:, ["symbol", "exchange", "type", "timeframe", "name", "isin", "start", "end", "path"]]
+        df = df.join(res).reset_index()
+        df = df.loc[:, ["symbol", "exchange", "type", "timeframe", "name",
+                        "isin", "start", "end", "path", "fundamentals_path"]]
         pl.from_pandas(df).to_csv(f"{self.path}/Temp/available_files.csv")
+    
+        return None
 
-    def get_response(self, url):
-        request = f"{self.host}{url}api_token={self.api_key}&fmt=json"
-        requestResponse = r.get(request)
-        return requestResponse.json()   
+    def _get_info(self, symbol, typ, duplicates, infos):
+        """ Helper function to access the additional information 
+            of a single symbol"""
+
+        if symbol in duplicates.Code.values:
+            ind = np.logical_and(duplicates.Code == symbol, duplicates.Type == typ)
+            name = duplicates.Name.loc[ind].values[0]
+            isin = duplicates.Isin.loc[ind].values[0]
+            exchange = duplicates.Exchange.loc[ind].values[0]
+        else:
+            ind = np.logical_and(infos.index == symbol, infos.Type == typ)
+            temp_df = infos.loc[ind,:]
+
+            if len(np.shape(temp_df)) == 2:
+                name = temp_df.Name[np.argmax([len(s) for s in temp_df.Name])]
+                isin = temp_df.Isin[np.argmax([len(s) for s in temp_df.Isin])]
+                exchange = temp_df.Exchange[0]
+            else:
+                name = temp_df.Name
+                isin = temp_df.Isin
+                exchange = temp_df.Exchange
+
+        return [symbol, name, isin, exchange]
     
     def download_ticker(self, ticker, exchange, timeframe, startdate=None, enddate=None):
+        """ Downloads price data for a single ticker.
+
+        This method downloads a ticker from an exchange
+        in a specified bar frequency for a given time period.
+
+        Parameters
+        ----------
+        ticker : str
+            The ticker symbol of interest.
+        exchange: str
+            Exchange to download the ticker from.
+        timeframe: int
+            Bar frequency.
+        startdate: str (fmt: Y-m-d H:M:s)
+            Date that specifies the startpoint.
+        enddate: str (fmt: Y-m-d H:M:s)
+            Date that specifies the endpoint.
+
+        Returns
+        -------
+        df: pandas.DataFrame
+            Price data (ohlcv).
+        """
         if timeframe == 1440:
             url = f"eod/{ticker}.{exchange}?"
             if startdate:
                 url = url + f"from={startdate}&"
             if enddate:
                 url = url + f"to={enddate}&"
-            df = pd.DataFrame.from_dict(self.get_response(url))
+            df = pd.DataFrame.from_dict(self._get_response(url))
         else:
             if not startdate:
-                startdate = pd.to_datetime("2020-10-01 00:00:00")
+                startdate = pd.to_datetime("2017-01-01 00:00:00")
                 enddate = pd.to_datetime(datetime.datetime.now())
             intervals = pd.date_range(start=startdate, end=enddate, freq=f"100D")
             intervals = np.unique(np.concatenate([[startdate], intervals.to_list(), [enddate]]))
@@ -146,93 +285,261 @@ class EODDownloader(BaseClass):
                 start = intervals[i-1] 
                 end = intervals[i]
                 url = f"intraday/{ticker}.{exchange}?from={start}&to={end}&interval={timeframe}m&"
-                temp_df = pd.DataFrame.from_dict(self.get_response(url))
+                temp_df = pd.DataFrame.from_dict(self._get_response(url))
                 df = pd.concat([df, temp_df])  
         df.drop_duplicates(subset=['date'], inplace=True)
 
         return df
 
-    def _populate_one(self, ticker, exchange, timeframes, t, types):
-        if ticker in self.duplicates.Code.values:
-                info = self.duplicates.loc[np.logical_and(self.duplicates.Code == ticker, self.duplicates.Exchange == exchange)]
-                if info.Type.values[0] == "None":
-                    self.print(msg=f"{t}: {exchange} - {ticker} not downloaded - DUPLICATE.")
-        else:
-            for timeframe in timeframes:
-                if not types or t in types:
-                    try:
-                        if not os.path.isfile(f"{self.path}/Data/{t}/{timeframe}/{ticker}_{timeframe}.csv"):
-                            df = self.download_ticker(ticker=ticker, exchange=exchange, timeframe=timeframe)
-                            pl.from_pandas(df).to_csv(f"{self.path}/Data/{t}/{timeframe}/{ticker}_{timeframe}.csv")
-                            self.print(msg=f"{t}: {exchange} - {ticker}_{timeframe}\tfrom {pd.to_datetime(df.date.iloc[1]).date()} till {pd.to_datetime(df.date.iloc[-1]).date()} successfully downloaded!")
-                        else:
-                            self.print(msg=f"{t}: {exchange} - {ticker}_{timeframe}\talready exists!")
-                    except Exception as e:
-                        self.print(msg=f"{t}: {exchange} - {ticker}_{timeframe} failed due to: {e}")
-
     def populate_tickers(self, types, timeframes):
-        if self.verbose:
-            print("###################################################\n\
-                  Populating Tickers!\n###################################################")
+        """ Downloads price data for every ticker of interest.
+
+        This method downloads all tickers of the specified
+        asset type and bar frequency. Stores results in
+        ".../PriceData/..." in .csv file. Uses parallelization.
+
+        Parameters
+        ----------
+        types : list
+            List of strings with asset types of interest.
+        timeframes: list
+            List of integers with bar frequency of interest.
+
+        Returns
+        -------
+        None
+        """
+        self._print(msg="Populating Tickers!")
 
         for typ in types:
-            self.create_folder(f"Data/{typ}")
+            self._create_folder(f"PriceData/{typ}")
             for timeframe in timeframes:
-                self.create_folder(f"Data/{typ}/{timeframe}")
+                self._create_folder(f"PriceData/{typ}/{timeframe}")
 
-        ticker_list = pd.concat([pl.read_csv(f"{self.path}/TickerInfo/TickerLists/{exchange}.csv").to_pandas()\
-                                    for exchange in self.exchanges])
+        tickers = [pl.read_csv(f"{self.path}/TickerInfo/TickerLists/{exchange}.csv").to_pandas()\
+                   for exchange in self.exchanges]
+        ticker_list = pd.concat(tickers)
         self.duplicates = pd.read_csv("D:/EOD/duplicates.csv")
 
         if not types:
             for typ in ticker_list.Type.unique():
-                self.create_folder(f"Data/{typ}") 
+                self._create_folder(f"PriceData/{typ}") 
                 for timeframe in timeframes:
-                    self.create_folder(f"Data/{typ}/{timeframe}")
+                    self._create_folder(f"PriceData/{typ}/{timeframe}")
 
-            l = []
-            for code, name, exchange, t, isin in ticker_list.loc[:, ["Code", "Name", "Exchange", "Type", "Isin"]].to_numpy():
+        l = []
+        selection = ["Code", "Name", "Exchange", "Type", "Isin"]
+        for code, _, exchange, t, _ in ticker_list.loc[:, selection].to_numpy():
+            if code == "FOO" or code == "MTE":
                 l.append((code, exchange, timeframes, t, types))
-            with Pool(36) as p:
-                p.starmap(self._populate_one, l)
+            
+        with Pool(self.cores) as p:
+            p.starmap(self._populate_one, l)
                                       
         self.get_available_files()
 
-    def update_files(self):
+        return None
 
-        self.print(msg=f"Updating files!")
+    def _populate_one(self, ticker, exchange, timeframes, t, types):
+        """ Helper function to populate one ticker
+        
+        This method checks if the ticker to download
+        is a duplicate and downloads it if it is not for
+        every bar frequency of interest.
+
+        Parameters
+        ----------
+        ticker : str
+            Ticker of interest.
+        exchange: str
+            Exchange from which the ticker can be downloaded.
+        timeframes: list
+            List of integers with bar frequencies of interest.
+        t: str
+            Asset type of the symbol.
+        types: list
+            List of asset types of interest.
+
+        Returns
+        -------
+        None
+        """
+
+        if ticker in self.duplicates.Code.values:
+                info = self.duplicates.loc[
+                    np.logical_and(self.duplicates.Code     == ticker,
+                                   self.duplicates.Exchange == exchange)
+                    ]
+                if info.Type.values[0] == "None":
+                    self._print_ticker_info("not downloaded - DUPLICATE.", t, ticker, "")
+        else:
+            for timeframe in timeframes:
+                if not types or t in types:
+                    try:
+                        if not os.path.isfile(
+                                f"{self.path}/PriceData/{t}/{timeframe}/{ticker}_{timeframe}.csv"):
+                            df = self.download_ticker(ticker=ticker, 
+                                                      exchange=exchange, 
+                                                      timeframe=timeframe)
+                            pl.from_pandas(df).to_csv(
+                                f"{self.path}/PriceData/{t}/{timeframe}/{ticker}_{timeframe}.csv"
+                                )
+                            t1 = pd.to_datetime(df.date.iloc[1]).date()
+                            t2 = pd.to_datetime(df.date.iloc[-1]).date()
+                            self._print_ticker_info(f"from {t1} till {t2} successfully downloaded!",
+                                                    t, ticker, timeframe)
+                        else:
+                            self._print_ticker_info("already exists!", t, ticker, timeframe)
+                            
+                    except Exception as e:
+                        self._print_ticker_info(f"failed due to: {e}", t, ticker, timeframe)
+
+        return None
+
+    def populate_fundamentals(self, force_update=False):
+        """ Downloads fundamental data for every available ticker.
+
+        Parameters
+        ----------
+        force_update : boolean
+            If True, fundamentals will be downloaded regardless
+            if it is already available.
+
+        Returns
+        -------
+        None
+        """
         if not os.path.isfile(f"{self.path}/Temp/available_files.csv"):
             self.get_available_files()
-        df = pl.read_csv(f"{self.path}/Temp/available_files.csv").to_pandas()
-        iter = df.loc[:,["symbol", "exchange", "type", "timeframe", "start", "end", "path"]].to_numpy()
-        df.set_index("symbol", inplace=True)
 
-        for symbol, exchange, type, timeframe, start, end, path\
-                in tqdm(iter): 
-            try:
-                file = pl.read_csv(path).to_pandas()
+        df = pl.read_csv(f"{self.path}/Temp/available_files.csv").to_pandas()
+        iter = df.loc[:,["symbol", "exchange", "type"]].to_numpy()  
+
+        l = []
+        for symbol, exchange, typ in iter:
+            self._create_folder(folder=f"Fundamentals/{typ}")
+            if typ == "ETF":
+                l.append((symbol, "XETRA", typ, force_update))
+            else:
+                l.append((symbol, exchange, typ, force_update))
+
+        with Pool(self.cores) as p:
+            p.starmap(self._populate_one_fundamental, l)
+
+        self.get_available_files()
+    
+        return None
+
+    def _populate_one_fundamental(self, symbol, exchange, typ, force_update):
+        """ Helper function that downloads fundamental data 
+            for a single ticker."""
+
+        try:
+            if not os.path.isfile(f"{self.path}/Fundamentals/{typ}/{symbol}.txt") or force_update:              
+                url = f"fundamentals/{symbol}.{exchange}?"
+                response = self._get_response(url)
+
+                with open(f"{self.path}/Fundamentals/{typ}/{symbol}.txt", "w") as outfile:
+                    json.dump(response, outfile)
+                
+                self._print_ticker_info("Fundamentals successfully downloaded!", typ, symbol, "")
+            else:
+                self._print_ticker_info("Fundamentals already exists!", typ, symbol, "")
+
+        except Exception as e:
+            self._print_ticker_info(f"failed due to: {e}", typ, symbol, "")
+        
+
+    def update_price_data(self, asset_types, timeframes):
+        """ Updates price data for asset types and bar frequencies
+            of interest.
+
+        Checks if the price data for a ticker is out of date and
+        updates it if neccessary. Stores price data in ".../PriceData/...".
+        Uses parallelization.
+
+        Parameters
+        ----------
+        asset_types : list
+            List of strings that specify asset types of interest.
+        timeframes: list
+            List of integers that specify bar frequencies of interest.
+
+        Returns
+        -------
+        None
+        """
+        self._print(msg=f"Updating files!")
+        if not os.path.isfile(f"{self.path}/Temp/available_files.csv"):
+            self.get_available_files()
+            
+        df = pl.read_csv(f"{self.path}/Temp/available_files.csv").to_pandas()
+        
+        # Filtering for asset types
+        if asset_types:
+            ind = np.array([df.type.to_numpy() == asset_type 
+                            for asset_type in asset_types]).T.sum(axis=1) > 0
+            df = df.loc[ind]
+
+        # Filtering for timeframes
+        if timeframes: 
+            ind = np.array([df.timeframe.to_numpy() == timeframe 
+                            for timeframe in timeframes]).T.sum(axis=1) > 0
+            df = df.loc[ind]
+
+        selection = ["symbol", "exchange", "type", "timeframe", "path"]
+        iter = df.loc[:, selection].to_numpy()
+
+        l = []
+        for symbol, exchange, typ, timeframe, path in iter:
+            l.append((symbol, exchange, typ, timeframe, path))
+
+        with Pool(self.cores) as p:
+            p.starmap(self._update_one_price_data, l)   
+
+        self.get_available_files()   
+
+        return None            
+    
+    def _update_one_price_data(self, symbol, exchange, typ, timeframe, path):
+        """ Helper function that updates the price data
+            for a single ticker."""
+
+        try:
+            file = pl.read_csv(path).to_pandas()
+            last_date = pd.to_datetime(file.date.iloc[-1])
+            if last_date < pd.to_datetime(datetime.now().date()):
                 update = self.download_ticker(ticker=symbol,
                                             exchange=exchange,
                                             timeframe=timeframe,
-                                            startdate=end)
+                                            startdate=last_date)
+                if pd.to_datetime(update.date.iloc[-1]) == last_date:
+                    self._print_ticker_info(f"no new data available at {last_date}!",
+                                             typ, symbol, timeframe) 
+                    return None
+
                 update = pd.concat([file, update])
                 update.date = pd.to_datetime(update.date)
-                update.drop_duplicates(subset=['date'], inplace=True)  
-                update.date = update.date.apply(lambda x: x.strftime('%Y-%m-%d'))
-            except:
-                update = self.download_ticker(ticker=symbol,
-                                            exchange=exchange,
-                                            timeframe=timeframe)
-            if update.empty:
-                print(symbol, exchange, timeframe, start, end, path, update)
-                break
+                update.drop_duplicates(subset=['date'], keep="last", inplace=True)  
+                update.date = update.date.apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S'))
+            else:
+                self._print_ticker_info(f"up to date at {last_date}!", typ, symbol, timeframe)
+                return None
 
-            df.loc[symbol, "end"] = np.datetime64(update.date.iloc[-1])
+            date_before = pd.to_datetime(file.date.iloc[-1])
+            date_after = update.date.iloc[-1]
+            update = update.reset_index(drop=True)  
             pl.from_pandas(update).to_csv(path)   
-            # self.print(f"{type}:\t{symbol}_{timeframe} updated from {last} to {update.date.iloc[-1]}!")
-        pl.from_pandas(df.reset_index()).to_csv(f"{self.path}/Temp/available_files.csv")  
-        self.get_available_files()               
-    
+            self._print_ticker_info(f"updated from {date_before} to {date_after}!",
+                                    typ, symbol, timeframe)
+                
+            return None
+
+        except Exception as e:
+            print(e, symbol)
+        
+        return None
+
 if __name__ == "__main__":
     
     api_key = "60abb74aa4a375.36407570"
@@ -242,8 +549,6 @@ if __name__ == "__main__":
     timeframes = [1440]
     eod = EODDownloader(api_key=api_key, exchanges=exchanges, folder=folder)
     eod.populate_tickers(types=types, timeframes=timeframes)
-    # eod.update_files()
-    # eod.get_available_files()
+    # eod.update_price_data(asset_types=types, timeframes=timeframes)
+    eod.populate_fundamentals(force_update=False)
 
-   
-# 
