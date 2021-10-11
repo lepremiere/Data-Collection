@@ -7,5 +7,10 @@ if __name__ == "__main__":
     types = []
     timeframes = [1440]
     eod = EODDownloader(api_key=api_key, exchanges=exchanges, folder=folder)
-    df = eod.download_ticker(ticker="GSPC", exchange="INDX", timeframe=1440, startdate="1900-01-01", enddate="2022-01-01")
-    df.to_csv("SP500_D1.csv")
+    for i in [15, 60, 240]:
+        df = eod.download_ticker(ticker="GSPC",
+                                exchange="INDX", 
+                                timeframe=i, 
+                                startdate="2010-01-01", 
+                                enddate="2022-01-01")
+        df.to_csv(f"sp_{i}.csv", index=False)

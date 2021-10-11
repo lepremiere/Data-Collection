@@ -12,7 +12,7 @@ class EODDownloader(BaseClass):
 
     def __init__(self, api_key, exchanges, folder=None, verbose=True):
         """ This class provides a solution to automatically 
-        downloading data from Tiingos RESTful API. """
+        downloading data from EOD RESTful API. """
 
         super().__init__(folder=folder, verbose=verbose)
         self.host = "https://eodhistoricaldata.com/api/"
@@ -69,7 +69,7 @@ class EODDownloader(BaseClass):
 
         self._print(msg=f"Getting available exchanges!")
         url = "exchanges-list/?"
-        exchanges_list = pd.DataFrame.from_dict(self.get_response(url=url))
+        exchanges_list = pd.DataFrame.from_dict(self._get_response(url=url))
         pl.from_pandas(exchanges_list).to_csv(f"{self.path}/TickerInfo/exchangesList.csv")
         
         l = []
@@ -95,7 +95,7 @@ class EODDownloader(BaseClass):
         self._print(msg=f"Getting available ticker for {name} - {exchange}...")
         url = f"exchange-symbol-list/{exchange}?"
         ticker_list = pd.DataFrame.from_dict(self._get_response(url=url))
-        pl.from_pandas(ticker_list).to_csv(f"{self.path}/TickerInfo/TickerLists/{exchange}.csv")
+        ticker_list.to_csv(f"{self.path}/TickerInfo/TickerLists/{exchange}.csv")
 
         return None
 
@@ -128,7 +128,6 @@ class EODDownloader(BaseClass):
         -------
         None
         """
-
         self._print(msg=f"Getting available files!")
         folder = f"{self.path}/PriceData/"
         d = {}
@@ -191,7 +190,7 @@ class EODDownloader(BaseClass):
         if not os.path.isfile(f"{self.path}/Temp/available_files.csv"):
             self.get_available_files()
         df = pl.read_csv(f"{self.path}/Temp/available_files.csv").to_pandas()
-        df.set_index("symbol", inplace=True)
+        # df.set_index("symbol", inplace=True)
 
         infos = pd.concat([pl.read_csv(f"{self.path}/TickerInfo/TickerLists/{exchange}.csv")\
                             .to_pandas() for exchange in self.exchanges])                
@@ -199,17 +198,17 @@ class EODDownloader(BaseClass):
         duplicates = pl.read_csv(f"{self.path}/duplicates.csv").to_pandas()
 
         l = []
-        for i in range(len(df)):    
-            symbol = df.index[i]
-            typ = df.type[i]
-            l.append((symbol, typ, duplicates, infos))
+        for typ, symbol, path in df.loc[:, ["type", "symbol", "path"]].to_numpy():   
+            l.append((symbol, typ, path, duplicates, infos))
 
         with Pool(self.cores) as p:
             res = p.starmap(self._get_info, l)
         
-        res = pd.DataFrame(res, columns=["symbol", "name", "isin", "exchange"])
+        cols = ["symbol", "name", "isin", "exchange"]
+        res = pd.DataFrame(res, columns=cols)
         res.set_index("symbol", inplace=True)
 
+        df.set_index("symbol", inplace=True)
         df = df.join(res).reset_index()
         df = df.loc[:, ["symbol", "exchange", "type", "timeframe", "name",
                         "isin", "start", "end", "path", "fundamentals_path"]]
@@ -217,27 +216,32 @@ class EODDownloader(BaseClass):
     
         return None
 
-    def _get_info(self, symbol, typ, duplicates, infos):
+    def _get_info(self, symbol, typ, path, duplicates, infos):
         """ Helper function to access the additional information 
             of a single symbol"""
-
-        if symbol in duplicates.Code.values:
-            ind = np.logical_and(duplicates.Code == symbol, duplicates.Type == typ)
-            name = duplicates.Name.loc[ind].values[0]
-            isin = duplicates.Isin.loc[ind].values[0]
-            exchange = duplicates.Exchange.loc[ind].values[0]
-        else:
-            ind = np.logical_and(infos.index == symbol, infos.Type == typ)
-            temp_df = infos.loc[ind,:]
-
-            if len(np.shape(temp_df)) == 2:
-                name = temp_df.Name[np.argmax([len(s) for s in temp_df.Name])]
-                isin = temp_df.Isin[np.argmax([len(s) for s in temp_df.Isin])]
-                exchange = temp_df.Exchange[0]
+        try:
+            if symbol in duplicates.Code.values:
+                ind = np.logical_and(duplicates.Code == symbol, duplicates.Type == typ)
+                name = duplicates.Name.loc[ind].values[0]
+                isin = duplicates.Isin.loc[ind].values[0]
+                exchange = duplicates.Exchange.loc[ind].values[0]
             else:
-                name = temp_df.Name
-                isin = temp_df.Isin
-                exchange = temp_df.Exchange
+                ind = np.logical_and(infos.index == symbol, infos.Type == typ)
+                temp_df = infos.loc[ind,:]
+
+                if len(np.shape(temp_df)) == 2:
+                    name = temp_df.Name[np.argmax([len(s) for s in temp_df.Name])]
+                    isin = temp_df.Isin[np.argmax([len(s) for s in temp_df.Isin])]
+                    exchange = temp_df.Exchange[0]
+                else:
+                    name = temp_df.Name
+                    isin = temp_df.Isin
+                    exchange = temp_df.Exchange
+
+        except Exception as e:
+            self._print_ticker_info(f"no longer supported! Deleted!", typ, symbol, "")
+            os.remove(path)
+            return []
 
         return [symbol, name, isin, exchange]
     
@@ -274,8 +278,11 @@ class EODDownloader(BaseClass):
             df = pd.DataFrame.from_dict(self._get_response(url))
         else:
             if not startdate:
-                startdate = pd.to_datetime("2017-01-01 00:00:00")
-                enddate = pd.to_datetime(datetime.datetime.now())
+                startdate = "2017-01-01 00:00:00"
+                enddate = datetime.datetime.now()
+            startdate = pd.to_datetime(startdate)
+            enddate = pd.to_datetime(enddate)
+
             intervals = pd.date_range(start=startdate, end=enddate, freq=f"100D")
             intervals = np.unique(np.concatenate([[startdate], intervals.to_list(), [enddate]]))
             intervals = (pd.to_datetime(intervals) - pd.Timestamp("1970-01-01")) // pd.Timedelta('1s')
@@ -286,8 +293,14 @@ class EODDownloader(BaseClass):
                 end = intervals[i]
                 url = f"intraday/{ticker}.{exchange}?from={start}&to={end}&interval={timeframe}m&"
                 temp_df = pd.DataFrame.from_dict(self._get_response(url))
-                df = pd.concat([df, temp_df])  
+                df = pd.concat([df, temp_df])       
+            
+        if "timestamp" in df.columns:
+            df.insert(loc=0, column="date", value=pd.to_datetime(df.timestamp, unit="s"))
+            df.drop(["timestamp", "gmtoffset"], axis=1, inplace=True)
+
         df.drop_duplicates(subset=['date'], inplace=True)
+        print(df)
 
         return df
 
@@ -330,17 +343,18 @@ class EODDownloader(BaseClass):
         l = []
         selection = ["Code", "Name", "Exchange", "Type", "Isin"]
         for code, _, exchange, t, _ in ticker_list.loc[:, selection].to_numpy():
-            if code == "FOO" or code == "MTE":
-                l.append((code, exchange, timeframes, t, types))
+            if not types or t in types:
+                for timeframe in timeframes:
+                    l.append((code, exchange, timeframe, t))
             
         with Pool(self.cores) as p:
-            p.starmap(self._populate_one, l)
+            p.starmap(self._populate_one_price_data, l)
                                       
         self.get_available_files()
 
         return None
 
-    def _populate_one(self, ticker, exchange, timeframes, t, types):
+    def _populate_one_price_data(self, ticker, exchange, timeframe, t):
         """ Helper function to populate one ticker
         
         This method checks if the ticker to download
@@ -364,7 +378,6 @@ class EODDownloader(BaseClass):
         -------
         None
         """
-
         if ticker in self.duplicates.Code.values:
                 info = self.duplicates.loc[
                     np.logical_and(self.duplicates.Code     == ticker,
@@ -373,30 +386,28 @@ class EODDownloader(BaseClass):
                 if info.Type.values[0] == "None":
                     self._print_ticker_info("not downloaded - DUPLICATE.", t, ticker, "")
         else:
-            for timeframe in timeframes:
-                if not types or t in types:
-                    try:
-                        if not os.path.isfile(
-                                f"{self.path}/PriceData/{t}/{timeframe}/{ticker}_{timeframe}.csv"):
-                            df = self.download_ticker(ticker=ticker, 
-                                                      exchange=exchange, 
-                                                      timeframe=timeframe)
-                            pl.from_pandas(df).to_csv(
-                                f"{self.path}/PriceData/{t}/{timeframe}/{ticker}_{timeframe}.csv"
-                                )
-                            t1 = pd.to_datetime(df.date.iloc[1]).date()
-                            t2 = pd.to_datetime(df.date.iloc[-1]).date()
-                            self._print_ticker_info(f"from {t1} till {t2} successfully downloaded!",
-                                                    t, ticker, timeframe)
-                        else:
-                            self._print_ticker_info("already exists!", t, ticker, timeframe)
-                            
-                    except Exception as e:
-                        self._print_ticker_info(f"failed due to: {e}", t, ticker, timeframe)
+            try:
+                if not os.path.isfile(
+                        f"{self.path}/PriceData/{t}/{timeframe}/{ticker}_{timeframe}.csv"):
+                    df = self.download_ticker(ticker=ticker, 
+                                                exchange=exchange, 
+                                                timeframe=timeframe)
+                    pl.from_pandas(df).to_csv(
+                        f"{self.path}/PriceData/{t}/{timeframe}/{ticker}_{timeframe}.csv"
+                        )
+                    t1 = pd.to_datetime(df.date.iloc[1]).date()
+                    t2 = pd.to_datetime(df.date.iloc[-1]).date()
+                    self._print_ticker_info(f"from {t1} to {t2} successfully downloaded!",
+                                            t, ticker, timeframe)
+                else:
+                    self._print_ticker_info("already exists!", t, ticker, timeframe)
+                    
+            except Exception as e:
+                self._print_ticker_info(f"failed due to: {e}", t, ticker, timeframe)
 
         return None
 
-    def populate_fundamentals(self, force_update=False):
+    def populate_fundamentals(self, types, force_update=False):
         """ Downloads fundamental data for every available ticker.
 
         Parameters
@@ -413,6 +424,8 @@ class EODDownloader(BaseClass):
             self.get_available_files()
 
         df = pl.read_csv(f"{self.path}/Temp/available_files.csv").to_pandas()
+        if types:
+            df = df.loc[[typ in types for typ in df.type]]
         iter = df.loc[:,["symbol", "exchange", "type"]].to_numpy()  
 
         l = []
@@ -449,6 +462,66 @@ class EODDownloader(BaseClass):
         except Exception as e:
             self._print_ticker_info(f"failed due to: {e}", typ, symbol, "")
         
+    def populate_macroeconomics(self, force_update=False):
+        """ Downloads macroeconomical data for every available country.
+
+        Parameters
+        ----------
+        force_update : boolean
+            If True, macroeconomics will be downloaded regardless
+            if it is already available.
+
+        Returns
+        -------
+        None
+        """
+        self._print(msg=f"Populating Macroeconomics!")
+        self._create_folder("/Macroeconomics")
+
+        country_codes = pl.read_csv(f"{self.path}/country_codes.csv").to_pandas()
+        macro_indicators = pl.read_csv(f"{self.path}/macroeconomic_indicators.csv").to_pandas()
+
+        l = []
+        for code, country in country_codes.to_numpy():
+            l.append((code, country, macro_indicators.indicator, force_update))
+
+        with Pool(self.cores) as p:
+            p.starmap(self._populate_one_macroeconomics, l)
+
+        return None
+
+    def _populate_one_macroeconomics(self, code, country, macro_indicators, force_update):
+        """ Helper function to download all macroeconomical indicators for
+            a single country"""
+
+        if os.path.isfile(f"{self.path}/Macroeconomics/{code}.csv") and not force_update:
+            self._print(msg=f"Macroeconomics already exist for:  {code}, {country}")
+        else:
+            res = []
+            for macro_indicator in macro_indicators:
+                url = f"macro-indicator/{code}?indicator={macro_indicator}&"
+                response = self._get_response(url=url)
+                temp_df = pd.DataFrame.from_dict(response)
+                if temp_df.empty:
+                    continue
+                temp_df.columns = [col.lower() for col in temp_df.columns]
+                temp_df.date = pd.to_datetime(temp_df.date, errors='coerce')
+                temp_df = temp_df.loc[temp_df.date > pd.to_datetime("1900-01-01")]
+                temp_df.set_index("date", inplace=True)
+                temp_df = temp_df.value
+                temp_df.name = macro_indicator
+                res.append(temp_df)
+            
+            if len(res) == 0:
+                self._print(msg=f"No Macroeconomics available for: {code}, {country}")
+                return None
+
+            df = pd.concat(res, axis=1).sort_index(ascending=False) 
+            df = df.reset_index()
+            pl.from_pandas(df).to_csv(f"{self.path}/Macroeconomics/{code}.csv")
+            self._print(msg=f"Macroeconomics downloaded for:  {code}, {country}")
+
+        return None
 
     def update_price_data(self, asset_types, timeframes):
         """ Updates price data for asset types and bar frequencies
@@ -545,10 +618,12 @@ if __name__ == "__main__":
     api_key = "60abb74aa4a375.36407570"
     folder = "D:/EOD"
     exchanges = ["F", "XETRA"]
-    types = []
+    types = ["ETF"]
     timeframes = [1440]
     eod = EODDownloader(api_key=api_key, exchanges=exchanges, folder=folder)
-    eod.populate_tickers(types=types, timeframes=timeframes)
+    # eod.populate_tickers(types=types, timeframes=timeframes)
     # eod.update_price_data(asset_types=types, timeframes=timeframes)
-    eod.populate_fundamentals(force_update=False)
+    # eod.populate_fundamentals(types=types, force_update=False)
+    # eod.populate_macroeconomics(force_update=False)
+    eod.get_available_files()
 

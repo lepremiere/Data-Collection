@@ -1,11 +1,9 @@
 import os
-import csv
+import requests
 import numpy as np
 import pandas as pd
-from pandas.core.frame import DataFrame
 import polars as pl
-from requests import get
-from time import sleep
+from pandas.tseries.offsets import BDay
 from datetime import datetime
 from multiprocessing import Pool, cpu_count
 from lib.baseClass import BaseClass
@@ -18,13 +16,53 @@ class TiingoDownloader(BaseClass):
         """ Class Initialization"""
 
         super().__init__(folder=folder, verbose=verbose)
-        self._print(msg="Initialization!")
         self.verbose = verbose
         self.api_key = api_key
         self.cores = cpu_count() 
         self.host = "https://api.tiingo.com/"
         self.headers = {'Content-Type': 'application/json'}
         self.check_ticker()
+    
+    def _get_response(self, url: str):
+        """ Accessing API at endpoint specified by url """ 
+        # print(self.host + url + "&token=" + self.api_key)
+        # input("s")
+        if "?" in url:
+            requestResponse = requests.get(f"{self.host}{url}&token={self.api_key}",
+                                            headers=self.headers)
+        else:
+            requestResponse = requests.get(f"{self.host}{url}?token={self.api_key}",
+                                            headers=self.headers)
+        requestResponse = requestResponse.json() 
+
+        return requestResponse                  
+    
+    def _get_crypto(self, ticker: str, startdate: str, enddate: str, timeframe: int):
+
+        url = f"tiingo/crypto/prices?tickers={ticker}&startDate={startdate}\
+                &endDate={enddate}&resampleFreq={timeframe}min"
+        response = self._get_response(url)
+        if len(response) > 0:
+            return pd.DataFrame.from_dict(dict(response[0])['priceData'])
+        else:
+            return None
+
+    def _get_eod(self, ticker: str, startdate: str, enddate: str = None):
+        if enddate:
+            url = f"tiingo/daily/{ticker}/prices?startDate={startdate}&endDate={enddate}"
+        else:
+            url = f"tiingo/daily/{ticker}/prices?startDate={startdate}"
+        response = self._get_response(url)
+        
+        return pd.DataFrame.from_dict(response)
+
+    def _get_iex(self, ticker: str, startdate: str, enddate: str, timeframe: int):
+
+        url = f"iex/{ticker}/prices?startDate={startdate}&endDate={enddate}\
+                &columns=open,high,low,close,volume&resampleFreq={timeframe}min"
+        response = self._get_response(url)
+        
+        return pd.DataFrame.from_dict(response)
 
     def check_ticker(self, force_update=False):
         """ Gets up to date ticker information from API and
@@ -32,15 +70,15 @@ class TiingoDownloader(BaseClass):
 
         # Check last update to reduce API data load
         last_update = self._last_update(force_update=force_update)
-        if last_update and last_update <= pd.to_datetime(datetime.now().date()):
+        if last_update and last_update == pd.to_datetime(datetime.now().date()):
             self._print(msg=f"Ticker info up to date with last update: {last_update.date()}")
-            sup_tickers = pl.read_csv(f"{self.path}/TickerInfo/supported_tickers.csv").to_pandas()
-            sup_cryptos = pl.read_csv(f"{self.path}/TickerInfo/supported_crypto.csv").to_pandas()
+            sup_tickers = pd.read_csv(f"{self.path}/TickerInfo/supported_tickers.csv")
+            sup_cryptos = pd.read_csv(f"{self.path}/TickerInfo/supported_crypto.csv")
 
             return sup_tickers, sup_cryptos
                    
         # creating necessary folders in specified path
-        folders = ["Temp", "TickerInfo", "Data"]
+        folders = ["Temp", "TickerInfo", "PriceData"]
         for folder in folders: 
             self._create_folder(folder)
 
@@ -93,58 +131,54 @@ class TiingoDownloader(BaseClass):
         
         Returns
         -------
-            Pandas DataFrame: Table containing (ticker, symbol, timeframe, path) infos
+        hits: pandas.DataFrame
+            Ticker information for every available files.
         """
 
-        # Walking through subdirectories to detect files
-        folder = f"{self.path}/Data/"
+        self._print(msg=f"Getting available files!")
+        folder = f"{self.path}/PriceData/"
         d = {}
+
         for root, _, files in os.walk(folder):
             d[root] = files
 
-        # Walk through files. Getting attributes
-        hits = []
-        for key, files in d.items():
-            if len(files) > 0:
-                for file in files:
-                    symbol = str(file.split("_")[0])
-                    t = key.split("\\")[1] 
-                    typ = key.split("/")[-1].split("\\")[0]
-                    path = f"{key}/{file}"
-                    hits.append([typ, symbol, t, path])
-
-        hits = pd.DataFrame(hits, columns=["type", "symbol", "timeframe", "path"])
-        
-        if hits.empty:
-            self._print("No files found")
-            return None
-        
         l = []
-        [l.append((symbol, path)) for symbol, path in hits[["symbol", "path"]].to_numpy()]
-
+        for key, files in d.items():
+            if len(files) > 0 and files:
+                for file in files:
+                    l.append((key, file))
+        
         with Pool(self.cores) as p:
-            res = p.starmap(self._get_file_info, l)
+            hits = p.starmap(self._get_one_price_data, l)
 
-        hits = hits.merge(pd.concat(res, axis=0))
-        hits = hits.loc[:, ["type", "symbol", "timeframe", "startdate", "enddate", "missing", "path"]]
-        self._print(msg=f"{len(hits)} files found!")
-        pl.from_pandas(hits).to_csv(f"{self.path}/Temp/available_files.csv")
+        if len(hits) > 0:
+            cols = ["symbol", "type", "timeframe", "startdate", "enddate",
+                    "missing", "path", "fundamentals_path"]
+            hits = pd.DataFrame(hits, columns=cols, index=None)
+            hits = hits.reset_index().drop(columns="index")
+            pl.from_pandas(hits).to_csv(f"{self.path}/Temp/available_files.csv")
+            self._print(msg=f"{len(hits)} files found!")
+        else:
+            self._print(msg=f"No available files found!")
         
         return hits
-    
-    def _get_file_info(self, symbol, path):
 
+    def _get_one_price_data(self, key, file):
+        """ Helper function to access one price data file."""
+
+        path = f"{key}/{file}"
         df = pl.read_csv(path).to_pandas()
-        df.date = pd.to_datetime(df.date)
-
-        startdate = df.date.iloc[0].strftime("%Y-%m-%d %H:%M:%S")
-        enddate = df.date.iloc[-1].strftime("%Y-%m-%d %H:%M:%S")
-
+        symbol = str(file.split("_")[0])
+        typ, t = key.split("/")[-1].split("\\")
+        start, end = df.date.iloc[[0, -1]]
         missing = df.isnull().sum().sum()
 
-        return pd.DataFrame([[symbol, startdate, enddate, missing]],
-                            columns=["symbol", "startdate", "enddate", "missing"])
+        fundamentals_path = None
+        if os.path.isfile(f"{self.path}/Fundamentals/{typ}/{symbol}.txt"):
+            fundamentals_path = f"{self.path}/Fundamentals/{typ}/{symbol}.txt"
 
+        return [symbol, typ, t, start, end, missing, path, fundamentals_path]
+    
     def download_ticker(self, ticker: str, timeframe: int, startdate: str, enddate: str): 
         """ This function downloads a ticker for a given period and sampling frequency.
 
@@ -259,9 +293,9 @@ class TiingoDownloader(BaseClass):
         
         # Creating folders
         for asset_type in symbols.assetType.unique():
-            self._create_folder(f"/Data/{asset_type}")
+            self._create_folder(f"/PriceData/{asset_type}")
             for timeframe in timeframes:
-                self._create_folder(f"/Data/{asset_type}/{timeframe}")
+                self._create_folder(f"/PriceData/{asset_type}/{timeframe}")
 
         # Gathering all information and passing it as workload to Pool
         l = []
@@ -286,7 +320,7 @@ class TiingoDownloader(BaseClass):
 
         try:
             if not os.path.isfile((
-                    f"{self.path}/Data/{asset_type}/"
+                    f"{self.path}/PriceData/{asset_type}/"
                     f"{timeframe}/{ticker}_{timeframe}.csv")):
                 df = self.download_ticker(ticker=ticker, 
                                             startdate=start, 
@@ -301,7 +335,7 @@ class TiingoDownloader(BaseClass):
                 d1 = pd.to_datetime(df.date.iloc[0]).date()
                 d2 = pd.to_datetime(df.date.iloc[-1]).date()
                 pl.from_pandas(df).to_csv((
-                    f"{self.path}/Data/{asset_type}/"
+                    f"{self.path}/PriceData/{asset_type}/"
                     f"{timeframe}/{ticker}_{timeframe}.csv"
                     ))
                 self._print_ticker_info(f"from {d1} till {d2} successfully downloaded!", 
@@ -339,13 +373,13 @@ class TiingoDownloader(BaseClass):
         intervals = pd.date_range(start=span[0], end=span[-1], freq=f"{timeframe}min")
 
         l = []
-        n = 10000
-        d = len(intervals)//n
+        n = 5000               # Max number of rows of Tiingo API requests
+        d = len(intervals)//n   # Number of iterations for the loop
 
+        # Batched download if daterange is longer than n
         if len(intervals) > n:
-            for i in range(n, d*n+1, n):
-                l.append(self._get_crypto(ticker, intervals[i], intervals[i+1], timeframe))
-
+            for i in range(0, d*n, n):
+                l.append(self._get_crypto(ticker, intervals[i], intervals[i+n], timeframe))
             if type(l[-1]) == type(None) or l[-1].empty:
                 return None
 
@@ -402,9 +436,9 @@ class TiingoDownloader(BaseClass):
             symbols = symbols.loc[ind]
 
         # Creating folders
-        self._create_folder("Data/Crypto")
+        self._create_folder("PriceData/Crypto")
         for timeframe in timeframes:
-            self._create_folder(f"Data/Crypto/{timeframe}")
+            self._create_folder(f"PriceData/Crypto/{timeframe}")
 
         # Filter ticker that already have been tried to download and failed
         try:
@@ -433,7 +467,7 @@ class TiingoDownloader(BaseClass):
             counter = 0
             for timeframe in timeframes:
                 if not os.path.isfile((
-                        f"{self.path}/Data/Crypto/{timeframe}/"
+                        f"{self.path}/PriceData/Crypto/{timeframe}/"
                         f"{baseCurrency}_{quoteCurrency}_{timeframe}.csv")):
                     counter += 1
 
@@ -468,7 +502,7 @@ class TiingoDownloader(BaseClass):
                 if flag: continue
 
                 if not os.path.isfile((
-                    f"{self.path}/Data/Crypto/{timeframe}/"
+                    f"{self.path}/PriceData/Crypto/{timeframe}/"
                     f"{baseCurrency}_{quoteCurrency}_{timeframe}.csv")):
                     df = self.download_crypto(ticker=ticker,
                                             startdate=startdate, 
@@ -484,7 +518,7 @@ class TiingoDownloader(BaseClass):
                         d1 = pd.to_datetime(df.date.iloc[1]).date()
                         d2 = pd.to_datetime(df.date.iloc[-1]).date()
                         pl.from_pandas(df).to_csv((
-                            f"{self.path}/Data/Crypto/{timeframe}/"
+                            f"{self.path}/PriceData/Crypto/{timeframe}/"
                             f"{baseCurrency}_{quoteCurrency}_{timeframe}.csv"
                         ))
                         self._print_ticker_info(f"from {d1} till {d2} successfully downloaded!", 
@@ -526,11 +560,20 @@ class TiingoDownloader(BaseClass):
 
         # Filtering for asset type and timeframes
         sup_tickers = sup_tickers.loc[:, ["ticker", "endDate"]]
-        sup_tickers = sup_tickers.set_index("ticker").loc[av_files.symbol.unique()]
+        ind = sup_tickers.set_index("ticker").index.intersection(av_files.symbol.unique())
+        sup_tickers = sup_tickers.set_index("ticker").loc[ind, :]
 
         l = []
-        for asset_type, symbol, timeframe, startdate, path in av_files.to_numpy()[0:10]:
-            enddate = sup_tickers.loc[symbol, "endDate"]
+        for asset_type, symbol, timeframe, startdate, path in av_files.to_numpy():
+            if symbol not in sup_tickers.index:
+                self._print_ticker_info(f"no longer supported! Deleted!", 
+                                        asset_type, symbol, timeframe)
+                os.remove(path)
+                continue
+            if type(sup_tickers.loc[symbol, "endDate"]) == pd.Series:
+                enddate = pd.to_datetime(sup_tickers.loc[symbol, "endDate"]).max()
+            else:
+                enddate = sup_tickers.loc[symbol, "endDate"]
             l.append((asset_type, symbol, timeframe, startdate, enddate, path))
         
         with Pool(self.cores) as p:
@@ -539,15 +582,17 @@ class TiingoDownloader(BaseClass):
         return None
 
     def _update_one_ticker(self, asset_type, symbol, timeframe, startdate, enddate, path):
-        
-        df = pl.read_csv(path).to_pandas()
-        startdate = pd.to_datetime(df.date.iloc[-1])
-        enddate = pd.to_datetime(enddate)
+        """ Helper function to update a single ticker"""
+        try:
+            df = pl.read_csv(path).to_pandas()
+            startdate = pd.to_datetime(df.date.iloc[-1])
+            enddate = pd.to_datetime(enddate)
 
-        if startdate >= enddate:
-            self._print_ticker_info(f"at {enddate} up to date!", 
-                                    asset_type, symbol, timeframe)
-        else:
+            if enddate < pd.to_datetime(datetime.now().date()) - BDay(90):
+                self._print_ticker_info(f"ticker not active anymore!",
+                                        asset_type, symbol, timeframe)
+                return None
+
             if timeframe >= 1440:
                 dates = pd.DataFrame(None, index=pd.DatetimeIndex(df.date))
                 dates["year"] = dates.index.year
@@ -568,12 +613,23 @@ class TiingoDownloader(BaseClass):
                 self._print_ticker_info(f"updated from {startdate} to {df.date.iloc[-1]}!", 
                                         asset_type, symbol, timeframe)                        
             else:
-                temp_df = self.download_ticker(ticker=symbol, 
-                                                timeframe=timeframe, 
-                                                startdate=startdate, 
-                                                enddate=pd.to_datetime(datetime.now()))
+                update = self.download_ticker(ticker=symbol, 
+                                            timeframe=timeframe, 
+                                            startdate=startdate, 
+                                            enddate=pd.to_datetime(datetime.now()))
+                df = self._merge_update(df, update)
+                pl.from_pandas(df).to_csv(path)
+                self._print_ticker_info(f"updated from {startdate} to {df.date.iloc[-1]}!", 
+                                        asset_type, symbol, timeframe) 
+
+            return None
+
+        except Exception as e:
+            self._print_ticker_info(f"failed due to: {e}", asset_type, symbol, timeframe)
+            return None
 
     def _merge_update(self, df, update):
+
         df = pd.concat([df, update], axis=0)     
         df.date = pd.to_datetime(df.date).dt.tz_localize(None)
         df.drop_duplicates(subset=['date'], keep="last", inplace=True)
@@ -582,51 +638,69 @@ class TiingoDownloader(BaseClass):
         return df
 
     def update_cryptos(self, timeframes: list):
-        assert False, "Not Finished!"
-        """ This function downloads a crypto pair for a given period and sampling frequency.
+        """ This method updates every crypto pair price data for bar frequencies
+            of interest.
+
+        This method updates crypto pair price data for every available
+        price data that matches the bar frequencies of interest. Results
+        will be stored in ".../PriceData/Crypto/..." as .csv file.
+        Uses parallelization.
 
         Parameters
         ----------
-            ticker : str
-                Specifies the symbol to download
-            startdate :str
-                Date that specifies the first date of interest, fmt: 'YYYY-mm-dd HH:MM:ss'
-            enddate : str
-                Date that specifies the last date of interest, fmt: 'YYYY-mm-dd HH:MM:ss'
-            timeframe : str
-                Specifies the bar frequency. In minutes
+            timeframes : list
+                List of integers that specify the bar frequencies of interest.
         
         Returns
         -------
-        df : pandas.DataFrame
-                Table containing dates and price data (ohlcv+)
+        None
         """
-        self._print(msg=f"Updating CRYPTOS!")
-        for timeframe in timeframes:
-            folder = f"{self.path}/Data/Crypto/{timeframe}"
-            for _, _, files in os.walk(folder):
-                for file in files:
-                    try:
-                        ticker = file.split("_")[0]
-                        df = pl.read_csv(f"{folder}/{file}").to_pandas()
-                        startdate = pd.to_datetime(df.date.iloc[-1]).tz_localize(None)
-                        enddate = pd.to_datetime(datetime.now())
+        # Geting supported tickers
+        self._print(msg=f"Updating CRYPTO!")
+        av_files = pl.read_csv(f"{self.path}/Temp/available_files.csv").to_pandas()  
 
-                        if startdate >= enddate:
-                            self._print(msg=f"Crypto: {file.split('.')[0]} at {startdate} up to date!")
-                        else:
-                            temp_df = self.download_crypto(ticker=ticker, 
-                                                            timeframe=timeframe, 
-                                                            startdate=startdate, 
-                                                            enddate=enddate)
-                            df = pd.concat([df, temp_df], axis=0)
-                            df.drop_duplicates(subset=['date'], inplace=True)
-                            df = df.reset_index().drop(columns="index")
-                            pl.from_pandas(df).to_csv(f"{folder}/{file}")
-                            self._print(msg=f"Crypto: {file.split('.')[0]} from {startdate} to {df.date.iloc[-1]}!")
-                    except Exception as e:
-                        self._print(msg=f"Crypto: {ticker}_{timeframe} failed! - Reason: {e}")
-                        pass  
+        # Filtering for asset type and timeframes
+        ind1 = np.array(av_files.type.to_numpy() == "Crypto")       
+        ind2 = np.array([av_files.timeframe.to_numpy() == timeframe 
+                        for timeframe in timeframes]).T.sum(axis=1) > 0
+        ind  = np.logical_and(ind1, ind2)     
+        av_files = av_files.loc[ind, ["type", "symbol", "timeframe", "enddate", "path"]]
+
+        l = []
+        for asset_type, symbol, timeframe, enddate, path in av_files.to_numpy():
+            l.append((asset_type, symbol, timeframe, enddate, path))
+
+        with Pool(self.cores) as p:
+            p.starmap(self._update_one_crypto, l)
+        
+        self.get_available_files()
+        
+        return None
+    
+    def _update_one_crypto(self, asset_type, symbol, timeframe, enddate, path):
+        """ Helper function to update a single crypto pair"""
+        try:
+            df = pl.read_csv(path).to_pandas()
+            startdate = pd.to_datetime(df.date.iloc[-1]).tz_localize(None)
+            enddate = pd.to_datetime(datetime.now())
+
+            if startdate >= enddate:
+                self._print_ticker_info(f"{startdate} up to date!",
+                                        asset_type, symbol, timeframe)
+            else:
+                update = self.download_crypto(ticker=symbol, 
+                                              timeframe=timeframe, 
+                                              startdate=startdate, 
+                                              enddate=enddate)
+                df = self._merge_update(df, update)
+                pl.from_pandas(df).to_csv(path)
+                self._print_ticker_info(f"updated from {startdate} to {df.date.iloc[-1]}!", 
+                                        asset_type, symbol, timeframe) 
+
+        except Exception as e:
+            self._print_ticker_info(f"failed due to: {e}", asset_type, symbol, timeframe)
+        
+        return None
 
     def smooth_data(self):
         """ Standardizing column order, removing duplicates """
@@ -663,53 +737,30 @@ class TiingoDownloader(BaseClass):
         self._print(msg=f"{typ}:\t{symbol}_{timeframe} smoothed!")
         del df
 
-    def _get_response(self, url: str):
-        """ Accessing API at endpoint specified by url """ 
+    def populate_fundamentals(self):
 
-        # print(self.host + url + "&token=" + self.api_key)
-        # input("s")
-        while True:
-            requestResponse = get(f"{self.host}{url}&token={self.api_key}",
-                                        headers=self.headers)
-            requestResponse = requestResponse.json() 
-            if type(requestResponse) == dict:
-                assert False, "TO DO: Finish!"
-                break
-                # if "Error" in requestResponse["detail"]:
-                #     print(requestResponse)
-                #     self._print(msg=f"Data limit reached! Waiting 60 minutes.")
-                #     sleep(60)
-            else: 
-                break
+        definitions = pl.read_csv(
+            f"{self.path}/Fundamentals/fundamentals_definitions.csv"
+            ).to_pandas()
 
-        return requestResponse                  
-    
-    def _get_crypto(self, ticker: str, startdate: str, enddate: str, timeframe: int):
+        symbol = "msft"
+        response = self._get_response(url=f"tiingo/fundamentals/{symbol}/statements")
+        df = pd.DataFrame(response)
 
-        url = f"tiingo/crypto/prices?tickers={ticker}&startDate={startdate}\
-                &endDate={enddate}&resampleFreq={timeframe}min"
-        response = self._get_response(url)
-        if len(response) > 0:
-            return pd.DataFrame.from_dict(dict(response[0])['priceData'])
-        else:
-            return None
-
-    def _get_eod(self, ticker: str, startdate: str, enddate: str = None):
-        if enddate:
-            url = f"tiingo/daily/{ticker}/prices?startDate={startdate}&endDate={enddate}"
-        else:
-            url = f"tiingo/daily/{ticker}/prices?startDate={startdate}"
-        response = self._get_response(url)
-        
-        return pd.DataFrame.from_dict(response)
-
-    def _get_iex(self, ticker: str, startdate: str, enddate: str, timeframe: int):
-
-        url = f"iex/{ticker}/prices?startDate={startdate}&endDate={enddate}\
-                &columns=open,high,low,close,volume&resampleFreq={timeframe}min"
-        response = self._get_response(url)
-        
-        return pd.DataFrame.from_dict(response)
+        fin = []
+        for statement_type in definitions.statementType.unique():
+            res = []
+            for i in range(len(df)):
+                if statement_type in df.statementData.iloc[i].keys() and df.iloc[i].quarter != 0:
+                    temp_df = pd.DataFrame(df.statementData.iloc[i][statement_type])
+                    temp_df["date"] = df.iloc[i].date
+                    temp_df = pd.DataFrame(temp_df).pivot(index="date", 
+                                                          columns="dataCode", 
+                                                          values="value")
+                    res.append(temp_df)
+            fin.append(pd.concat(res))  
+        fin = pd.concat(fin, axis=1)
+        fin.to_csv("D:/bla.csv")
 
 if __name__ == "__main__":
 
@@ -721,8 +772,14 @@ if __name__ == "__main__":
     td = TiingoDownloader(api_key=api_key, folder=folder, verbose=True)
     # td.populate_tickers(exchanges=exchanges, asset_types=asset_types, timeframes=timeframes)
     # td.populate_cryptos(quote_currencies=["usd", "eur"], timeframes=timeframes)
-    td.update_tickers(asset_types=asset_types, timeframes=timeframes)
+    # td.update_tickers(asset_types=asset_types, timeframes=timeframes)
     # td.update_cryptos(timeframes=timeframes)
+    # td.populate_fundamentals()
+    for tic in ["adaeur", "btceur", "siaeur"]:
+        for i in [1,5,15,60,240]:
+            df = td.download_crypto(ticker=tic, startdate="2018-12-01", enddate="2021-10-03", timeframe=i)
+            df.to_csv(f"{tic}_{i}.csv", index=False)
+    # td.get_available_files()
     # td.smooth_data()
 
     

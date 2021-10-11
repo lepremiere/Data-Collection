@@ -22,7 +22,7 @@ class BaseClass:
             asset_type += ":"
             ticker = symbol + " " + str(timeframe)
             date = datetime.now().time().strftime('%H:%M:%S')
-            print(f"{date:<24}{asset_type:<16}{ticker:<18}{msg:<20}")
+            print(f"{date:<16}{asset_type:<16}{ticker:<18}{msg:<20}")
 
     def _create_folder(self, folder):
         if not os.path.exists(self.path + f"/{folder}/"):
